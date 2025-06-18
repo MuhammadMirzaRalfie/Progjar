@@ -1,85 +1,123 @@
+import csv
 import subprocess
 import time
-import csv
 import os
-from threading import Thread
-from stresstest import run_stresstest
+import signal
+from stresstest import stress_test
 
-# Path file server
-SERVER_THREAD = "server_multithread/file_server_thread.py"
-SERVER_PROCESS = "server_multiprocess/file_server_process.py"
+# Pengujian pada kedua tipe server pool
+SERVER_CONFIGS = [
+     {
+        "name": "ProcessPool",
+        "script": "file_server_process.py",
+        "mode": "process",
+        "port": 9001,
+    },
+     {
+        "name": "ThreadPool",
+        "script": "file_server_thread.py",
+        "mode": "thread",
+        "port": 9000,
+    }
+   
+]
 
-# CSV output file
-CSV_FILE = "experiment_results.csv"
-
-# Konfigurasi eksperimen
-OPERATIONS = ["upload", "download"]
-VOLUMES = [10, 50, 100]  # MB
+OPERATIONS = ['UPLOAD', 'DOWNLOAD']
+VOLUME_FILES = ['file_10mb.bin', 'file_50mb.bin', 'file_100mb.bin']
 CLIENT_WORKERS = [1, 5, 50]
 SERVER_WORKERS = [1, 5, 50]
+SERVER_HOST = 'localhost'
 
-def run_server(mode, workers):
-    """Jalankan server dengan mode dan jumlah worker tertentu"""
-    if mode == "thread":
-        cmd = ["python", SERVER_THREAD, str(workers)]
-    else:
-        cmd = ["python", SERVER_PROCESS, str(workers)]
+def prepare_test_files():
+    for fname, size in zip(VOLUME_FILES, [10*1024**2, 50*1024**2, 100*1024**2]):
+        if not os.path.exists(fname):
+            with open(fname, 'wb') as f:
+                f.write(os.urandom(size))
 
-    # Jalankan server sebagai subprocess
-    return subprocess.Popen(cmd)
+def start_server(server_script, server_workers, server_port):
+    env = os.environ.copy()
+    env["SERVER_POOL"] = str(server_workers)
+    env["PORT"] = str(server_port)
+    return subprocess.Popen(
+        ['python', server_script],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid if os.name != "nt" else None  # UNIX only
+    )
 
-def stop_server(process):
-    process.terminate()
-    process.wait()
+def stop_server(proc):
+    if proc.poll() is None:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+def wait_server_ready(host, port, timeout=5):
+    import socket
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect((host, port))
+            s.close()
+            return True
+        except Exception:
+            time.sleep(0.2)
+    return False
 
 def main():
-    # Pastikan CSV file ada header
-    if not os.path.exists(CSV_FILE):
-        with open(CSV_FILE, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "Nomor", "Server Mode", "Operasi", "Volume (MB)",
-                "Client Worker Pool", "Server Worker Pool",
-                "Waktu Total (s)", "Throughput (bytes/s)",
-                "Client Sukses", "Client Gagal", "Server Sukses", "Server Gagal"
-            ])
-
-    nomor = 1
-    for server_mode in ["thread", "process"]:
-        for server_workers in SERVER_WORKERS:
-            # Jalankan server dengan jumlah worker tertentu
-            print(f"\nMenjalankan server {server_mode} dengan {server_workers} worker")
-            server_proc = run_server(server_mode, server_workers)
-            time.sleep(2)  # Tunggu server start
-
+    prepare_test_files()
+    csv_path = 'stress_test_results.csv'
+    if os.path.exists(csv_path):
+        os.remove(csv_path)
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'No', 'ServerType', 'Operasi', 'Volume', 'ClientWorker', 'ServerWorker',
+            'WaktuTotal', 'Throughput (KB/s)', 'ClientSukses', 'ClientGagal', 'ServerSukses', 'ServerGagal'
+        ])
+        nomor = 1
+        for server_cfg in SERVER_CONFIGS:
+            print(f"\n=== Testing {server_cfg['name']} ===")
             for op in OPERATIONS:
-                for vol in VOLUMES:
-                    for client_workers in CLIENT_WORKERS:
-                        print(f"Stress test: Server={server_mode}, ServerWorkers={server_workers}, Op={op}, Volume={vol}MB, ClientWorkers={client_workers}")
-
-                        # Run stress test, sesuaikan multiprocessing jika server process
-                        use_mp = True if server_mode == "process" else False
-
-                        result = run_stresstest(op, vol, client_workers, use_multiprocessing=use_mp)
-
-                        # Catat hasil ke CSV
-                        with open(CSV_FILE, "a", newline="") as f:
-                            writer = csv.writer(f)
+                for vf in VOLUME_FILES:
+                    for nc in CLIENT_WORKERS:
+                        for ns in SERVER_WORKERS:
+                            print(f"[{nomor}] {server_cfg['name']} | {op} {vf} client={nc} server={ns} ...")
+                            proc = start_server(server_cfg['script'], ns, server_cfg['port'])
+                            if not wait_server_ready(SERVER_HOST, server_cfg['port']):
+                                print("Server gagal start!")
+                                stop_server(proc)
+                                continue
+                            try:
+                                result = stress_test(
+                                    server_cfg['mode'],
+                                    op,
+                                    vf,
+                                    SERVER_HOST,
+                                    server_cfg['port'],
+                                    nc,
+                                    ns
+                                )
+                            finally:
+                                stop_server(proc)
+                                time.sleep(1)  # Biarkan port benar-benar free
                             writer.writerow([
-                                nomor, server_mode, op, vol,
-                                client_workers, server_workers,
-                                f"{result['total_time']:.2f}",
-                                f"{result['avg_throughput']:.2f}",
-                                result['total_success'],
-                                result['total_fail'],
-                                "N/A",  # Server sukses/gagal bisa diisi dari log server
-                                "N/A"
+                                nomor, server_cfg['name'], op, vf, nc, ns,
+                                f"{result['waktu_total']:.2f}",
+                                f"{result['throughput']:.2f}",
+                                result['sukses'], result['gagal'],
+                                result.get('server_sukses', result['sukses']),
+                                result.get('server_gagal', result['gagal'])
                             ])
-                        nomor += 1
+                            f.flush()
+                            nomor += 1
 
-            # Stop server setelah kombinasi selesai
-            stop_server(server_proc)
-            time.sleep(1)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
